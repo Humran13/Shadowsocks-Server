@@ -1,0 +1,449 @@
+#!/usr/bin/env bash
+# shadowsocks-server-manager: main CLI / interactive TUI entrypoint
+set -Eeuo pipefail
+
+SS_LIB_DIR="${SS_LIB_DIR:-/usr/local/lib/shadowsocks-server}"
+# shellcheck source=lib/common.sh
+source "$SS_LIB_DIR/common.sh"
+# shellcheck source=lib/uri.sh
+source "$SS_LIB_DIR/uri.sh"
+# shellcheck source=lib/firewall.sh
+source "$SS_LIB_DIR/firewall.sh"
+
+SS_BINARY="${SS_BINARY:-$SS_BIN_DIR/ssserver}"
+
+# ---------------------------------------------------------------------------
+# Config generation: rebuild config.json from users.json (single source of truth)
+# ---------------------------------------------------------------------------
+rebuild_config() {
+  ensure_dirs; init_users_file
+  local tmp
+  tmp="$(mktemp "$SS_CONFIG_DIR/.tmp.XXXXXX")"
+  jq '{
+    servers: [ .users[] | select(.enabled == true) | {
+      server: "0.0.0.0",
+      server_port: .port,
+      password: .password,
+      method: .method,
+      mode: "tcp_and_udp"
+    } ]
+  }' "$SS_USERS_FILE" > "$tmp"
+
+  if ! jq empty "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; die "Generated config.json is invalid JSON; aborting"
+  fi
+
+  # Backup current working config before overwrite
+  if [[ -f "$SS_CONFIG_FILE" ]]; then
+    cp -f "$SS_CONFIG_FILE" "$SS_BACKUP_DIR/config.json.pre-$(date +%Y%m%d%H%M%S)"
+  fi
+  mv -f "$tmp" "$SS_CONFIG_FILE"
+  chmod 600 "$SS_CONFIG_FILE"
+}
+
+apply_config_or_rollback() {
+  local prev_backup
+  prev_backup="$(ls -t "$SS_BACKUP_DIR"/config.json.pre-* 2>/dev/null | head -1 || true)"
+  rebuild_config
+
+  local enabled_count
+  enabled_count="$(jq '[.servers[]] | length' "$SS_CONFIG_FILE")"
+  if [[ "$enabled_count" -eq 0 ]]; then
+    # ssserver refuses to start with an empty servers list; stopping is the
+    # correct state here rather than restarting into a guaranteed failure.
+    systemctl stop "$SS_SERVICE_NAME" 2>/dev/null || true
+    return 0
+  fi
+
+  if ! systemctl restart "$SS_SERVICE_NAME" 2>/dev/null; then
+    log_err "Service failed to restart with new configuration"
+    if [[ -n "$prev_backup" ]]; then
+      log_warn "Rolling back to previous configuration"
+      cp -f "$prev_backup" "$SS_CONFIG_FILE"
+      systemctl restart "$SS_SERVICE_NAME" || true
+    fi
+    return 1
+  fi
+  sleep 1
+  if ! systemctl is-active --quiet "$SS_SERVICE_NAME"; then
+    log_err "Service is not active after restart"
+    if [[ -n "$prev_backup" ]]; then
+      log_warn "Rolling back to previous configuration"
+      cp -f "$prev_backup" "$SS_CONFIG_FILE"
+      systemctl restart "$SS_SERVICE_NAME" || true
+    fi
+    return 1
+  fi
+  return 0
+}
+
+# ---------------------------------------------------------------------------
+# User management
+# ---------------------------------------------------------------------------
+next_available_port() {
+  local start=8388 p used
+  used="$(jq -r '.users[].port' "$SS_USERS_FILE" 2>/dev/null || true)"
+  p=$start
+  while echo "$used" | grep -qx "$p"; do
+    p=$((p+1))
+  done
+  echo "$p"
+}
+
+user_exists() {
+  jq -e --arg u "$1" '.users[] | select(.username == $u)' "$SS_USERS_FILE" >/dev/null 2>&1
+}
+
+cmd_add() {
+  ensure_dirs; init_users_file
+  local username="${1:-}" port="${2:-}" method="${3:-$DEFAULT_METHOD}" expiry="${4:-}"
+
+  if [[ -z "$username" ]]; then
+    read -rp "Username: " username
+  fi
+  validate_username "$username" || return 1
+  if user_exists "$username"; then
+    log_err "User '$username' already exists"; return 1
+  fi
+
+  if [[ -z "$port" ]]; then
+    local suggested; suggested="$(next_available_port)"
+    read -rp "Port [$suggested]: " port
+    port="${port:-$suggested}"
+  fi
+  validate_port "$port" || return 1
+  if port_in_use "$port"; then
+    log_err "Port $port is already assigned to another user"; return 1
+  fi
+
+  validate_method "$method" || return 1
+  local password
+  password="$(generate_password "$method")"
+
+  local created; created="$(date -u +%Y-%m-%d)"
+  local expiry_json="null"
+  if [[ -n "$expiry" ]]; then
+    validate_date "$expiry" || return 1
+    expiry_json="\"$expiry\""
+  fi
+
+  local new_user
+  new_user="$(jq -n \
+    --arg u "$username" --argjson p "$port" --arg m "$method" \
+    --arg pw "$password" --arg c "$created" --argjson exp "$expiry_json" \
+    '{username:$u, port:$p, method:$m, password:$pw, enabled:true, created:$c, expiry:$exp, notes:""}')"
+
+  local tmp; tmp="$(mktemp "$SS_CONFIG_DIR/.tmp.XXXXXX")"
+  jq --argjson nu "$new_user" '.users += [$nu]' "$SS_USERS_FILE" > "$tmp"
+  atomic_write_json "$SS_USERS_FILE" "$(cat "$tmp")"; rm -f "$tmp"
+
+  fw_open_port "$port"
+
+  if ! apply_config_or_rollback; then
+    log_err "Failed to apply new configuration; removing user record"
+    tmp="$(mktemp "$SS_CONFIG_DIR/.tmp.XXXXXX")"
+    jq --arg u "$username" '.users |= map(select(.username != $u))' "$SS_USERS_FILE" > "$tmp"
+    atomic_write_json "$SS_USERS_FILE" "$(cat "$tmp")"; rm -f "$tmp"
+    fw_close_port "$port"
+    return 1
+  fi
+
+  local host; host="$(get_display_host)"
+  local uri; uri="$(build_ss_uri "$method" "$password" "$host" "$port" "$username")"
+
+  echo
+  log_ok "User created successfully."
+  echo
+  echo "  Name:      $username"
+  echo "  Server:    $host"
+  echo "  Port:      $port"
+  echo "  Method:    $method"
+  echo "  Password:  $password"
+  echo "  TCP:       Enabled"
+  echo "  UDP:       Enabled"
+  echo
+  echo "  Shadowsocks URL:"
+  echo "  $uri"
+  echo
+  print_qr "$uri"
+  echo
+}
+
+cmd_list() {
+  init_users_file
+  printf "%-16s %-8s %-30s %-8s %-12s\n" "USERNAME" "PORT" "METHOD" "ENABLED" "EXPIRY"
+  jq -r '.users[] | [.username, (.port|tostring), .method, (.enabled|tostring), (.expiry // "-")] | @tsv' "$SS_USERS_FILE" |
+    while IFS=$'\t' read -r u p m e x; do
+      printf "%-16s %-8s %-30s %-8s %-12s\n" "$u" "$p" "$m" "$e" "$x"
+    done
+}
+
+get_user_or_fail() {
+  local username="$1"
+  if ! user_exists "$username"; then
+    log_err "No such user: $username"; return 1
+  fi
+}
+
+cmd_show() {
+  local username="${1:?Usage: shadowsocks show USERNAME}"
+  init_users_file
+  get_user_or_fail "$username" || return 1
+  local rec host uri
+  rec="$(jq -c --arg u "$username" '.users[] | select(.username==$u)' "$SS_USERS_FILE")"
+  host="$(get_display_host)"
+  local port method password
+  port="$(jq -r '.port' <<<"$rec")"
+  method="$(jq -r '.method' <<<"$rec")"
+  password="$(jq -r '.password' <<<"$rec")"
+  uri="$(build_ss_uri "$method" "$password" "$host" "$port" "$username")"
+  echo "Name:      $username"
+  echo "Server:    $host"
+  echo "Port:      $port"
+  echo "Method:    $method"
+  echo "Password:  $password"
+  echo "Enabled:   $(jq -r '.enabled' <<<"$rec")"
+  echo "Expiry:    $(jq -r '.expiry // "none"' <<<"$rec")"
+  echo
+  echo "Shadowsocks URL:"
+  echo "$uri"
+  echo
+  print_qr "$uri"
+}
+
+cmd_delete() {
+  local username="${1:?Usage: shadowsocks delete USERNAME}"
+  init_users_file
+  get_user_or_fail "$username" || return 1
+  local port; port="$(jq -r --arg u "$username" '.users[] | select(.username==$u) | .port' "$SS_USERS_FILE")"
+  local tmp; tmp="$(mktemp "$SS_CONFIG_DIR/.tmp.XXXXXX")"
+  jq --arg u "$username" '.users |= map(select(.username != $u))' "$SS_USERS_FILE" > "$tmp"
+  atomic_write_json "$SS_USERS_FILE" "$(cat "$tmp")"; rm -f "$tmp"
+  fw_close_port "$port"
+  apply_config_or_rollback || log_warn "Service restart after delete reported an issue; check status"
+  log_ok "User '$username' deleted"
+}
+
+cmd_set_enabled() {
+  local username="${1:?username required}" state="$2"
+  init_users_file
+  get_user_or_fail "$username" || return 1
+  local tmp; tmp="$(mktemp "$SS_CONFIG_DIR/.tmp.XXXXXX")"
+  jq --arg u "$username" --argjson e "$state" \
+    '.users |= map(if .username == $u then .enabled = $e else . end)' \
+    "$SS_USERS_FILE" > "$tmp"
+  atomic_write_json "$SS_USERS_FILE" "$(cat "$tmp")"; rm -f "$tmp"
+  apply_config_or_rollback || log_warn "Service restart reported an issue; check status"
+  log_ok "User '$username' $([[ $state == true ]] && echo enabled || echo disabled)"
+}
+
+cmd_enable()  { cmd_set_enabled "${1:?}" true; }
+cmd_disable() { cmd_set_enabled "${1:?}" false; }
+
+get_display_host() {
+  if [[ -f "$SS_MANAGER_CONF" ]] && grep -q '^HOST_OVERRIDE=' "$SS_MANAGER_CONF" 2>/dev/null; then
+    grep '^HOST_OVERRIDE=' "$SS_MANAGER_CONF" | cut -d= -f2-
+    return
+  fi
+  detect_public_ipv4
+}
+
+# ---------------------------------------------------------------------------
+# Status / diagnostics / logs
+# ---------------------------------------------------------------------------
+cmd_status() {
+  init_users_file
+  local state="Stopped"
+  if systemctl is-active --quiet "$SS_SERVICE_NAME" 2>/dev/null; then state="Running"
+  elif systemctl is-failed --quiet "$SS_SERVICE_NAME" 2>/dev/null; then state="Failed"
+  fi
+  local ver="unknown"
+  [[ -f "$SS_VERSION_FILE" ]] && ver="$(cat "$SS_VERSION_FILE")"
+  local ip; ip="$(get_display_host)"
+  local n; n="$(jq '.users | length' "$SS_USERS_FILE" 2>/dev/null || echo 0)"
+  echo "Server Status:  $state"
+  echo "Core:           shadowsocks-rust $ver"
+  echo "Server IP:      ${ip:-unknown}"
+  echo "Active Users:   $n"
+}
+
+cmd_restart() {
+  require_root
+  systemctl restart "$SS_SERVICE_NAME"
+  sleep 1
+  systemctl is-active --quiet "$SS_SERVICE_NAME" && log_ok "Service restarted" || log_err "Service failed to restart"
+}
+
+cmd_logs() {
+  local mode="${1:-recent}"
+  case "$mode" in
+    recent) journalctl -u "$SS_SERVICE_NAME" -n 100 --no-pager ;;
+    live)   journalctl -u "$SS_SERVICE_NAME" -f ;;
+    errors) journalctl -u "$SS_SERVICE_NAME" -p err -n 100 --no-pager ;;
+    *) die "Unknown log mode: $mode (expected: recent|live|errors)" ;;
+  esac
+}
+
+cmd_diagnostics() {
+  init_users_file
+  local pass=0 warn=0 fail=0
+  check() {
+    local desc="$1" status="$2"
+    case "$status" in
+      PASS) printf "  [%sPASS%s] %s\n" "$C_GREEN" "$C_RESET" "$desc"; pass=$((pass+1)) ;;
+      WARN) printf "  [%sWARN%s] %s\n" "$C_YELLOW" "$C_RESET" "$desc"; warn=$((warn+1)) ;;
+      FAIL) printf "  [%sFAIL%s] %s\n" "$C_RED" "$C_RESET" "$desc"; fail=$((fail+1)) ;;
+    esac
+  }
+
+  echo "Running diagnostics..."
+  echo
+
+  [[ -x "$SS_BINARY" ]] && check "shadowsocks-rust binary present" PASS || check "shadowsocks-rust binary present ($SS_BINARY)" FAIL
+
+  if [[ -x "$SS_BINARY" ]]; then
+    "$SS_BINARY" --version >/dev/null 2>&1 && check "Binary runs and reports version" PASS || check "Binary failed to run" FAIL
+  fi
+
+  json_validate "$SS_CONFIG_FILE" 2>/dev/null && check "config.json is valid JSON" PASS || check "config.json missing or invalid" WARN
+  json_validate "$SS_USERS_FILE" 2>/dev/null && check "users.json is valid JSON" PASS || check "users.json missing or invalid" FAIL
+
+  systemctl is-enabled --quiet "$SS_SERVICE_NAME" 2>/dev/null && check "systemd service enabled at boot" PASS || check "systemd service not enabled at boot" WARN
+  local user_count; user_count="$(jq '.users | length' "$SS_USERS_FILE" 2>/dev/null || echo 0)"
+  if systemctl is-active --quiet "$SS_SERVICE_NAME" 2>/dev/null; then
+    check "systemd service active" PASS
+  elif [[ "$user_count" -eq 0 ]]; then
+    check "systemd service inactive (expected: no users configured yet)" PASS
+  else
+    check "systemd service not active" FAIL
+  fi
+
+  [[ -d "$SS_CONFIG_DIR" ]] && [[ "$(stat -c %a "$SS_CONFIG_DIR" 2>/dev/null)" == "700" ]] && check "config directory permissions (700)" PASS || check "config directory permissions not 700" WARN
+
+  command -v jq >/dev/null 2>&1 && check "jq dependency present" PASS || check "jq missing" FAIL
+  command -v openssl >/dev/null 2>&1 && check "openssl dependency present" PASS || check "openssl missing" FAIL
+  command -v qrencode >/dev/null 2>&1 && check "qrencode present (optional)" PASS || check "qrencode not installed (QR codes disabled, non-fatal)" WARN
+
+  local avail; avail="$(df -Pk "$SS_CONFIG_DIR" 2>/dev/null | awk 'NR==2{print $4}')"
+  [[ -n "$avail" && "$avail" -gt 51200 ]] && check "sufficient disk space" PASS || check "low disk space" WARN
+
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsS --max-time 3 https://1.1.1.1 >/dev/null 2>&1 && check "outbound internet connectivity" PASS || check "outbound internet connectivity failed" WARN
+  fi
+
+  local ip; ip="$(detect_public_ipv4)"
+  [[ -n "$ip" ]] && check "public IPv4 detected ($ip)" PASS || check "could not detect public IPv4" WARN
+
+  echo
+  echo "Summary: $pass passed, $warn warnings, $fail failed"
+  [[ $fail -eq 0 ]]
+}
+
+# ---------------------------------------------------------------------------
+# Interactive menu
+# ---------------------------------------------------------------------------
+cmd_uninstall() {
+  require_root
+  echo "Uninstall Shadowsocks Server Manager"
+  echo "  1) Remove software but preserve config/backups in $SS_CONFIG_DIR"
+  echo "  2) Completely remove everything (software + config + backups)"
+  read -rp "Choose [1/2, anything else cancels]: " choice
+
+  case "$choice" in
+    1|2) : ;;
+    *) log_info "Uninstall cancelled"; return 0 ;;
+  esac
+
+  # Close firewall ports for every configured user (project-owned rules only)
+  if [[ -f "$SS_USERS_FILE" ]]; then
+    while IFS= read -r port; do
+      [[ -n "$port" ]] && fw_close_port "$port"
+    done < <(jq -r '.users[].port' "$SS_USERS_FILE" 2>/dev/null || true)
+  fi
+
+  systemctl stop "$SS_SERVICE_NAME" 2>/dev/null || true
+  systemctl disable "$SS_SERVICE_NAME" 2>/dev/null || true
+  rm -f "/etc/systemd/system/${SS_SERVICE_NAME}.service"
+  systemctl daemon-reload 2>/dev/null || true
+
+  rm -f "$SS_BIN_DIR/ssserver" "$SS_BIN_DIR/sslocal" "$SS_BIN_DIR/ssmanager" "$SS_BIN_DIR/ssurl"
+  rm -f "$SS_BIN_DIR/shadowsocks" "$SS_BIN_DIR/ss-manager"
+  rm -rf "$SS_LIB_DIR"
+  rm -rf "$SS_RUNTIME_DIR"
+
+  if [[ "$choice" == "2" ]]; then
+    rm -rf "$SS_CONFIG_DIR"
+    log_ok "Uninstall complete. All configuration and backups were removed."
+  else
+    log_ok "Uninstall complete. Configuration and backups preserved in $SS_CONFIG_DIR"
+  fi
+}
+
+pause() { read -rp "Press Enter to continue..." _ || true; }
+
+interactive_menu() {
+  while true; do
+    clear 2>/dev/null || true
+    echo "================================================"
+    echo " SHADOWSOCKS SERVER MANAGER"
+    echo "================================================"
+    cmd_status
+    echo
+    cat <<'MENU'
+ 1. Add User
+ 2. List Users
+ 3. Show User Configuration
+ 4. Enable / Disable User
+ 5. Delete User
+ 6. Traffic / Status
+ 7. Diagnostics / Repair
+ 8. Restart Service
+ 9. View Logs
+10. Uninstall
+11. Exit
+MENU
+    echo
+    read -rp "Select an option: " choice
+    case "$choice" in
+      1) cmd_add; pause ;;
+      2) cmd_list; pause ;;
+      3) read -rp "Username: " u; cmd_show "$u"; pause ;;
+      4) read -rp "Username: " u; read -rp "Enable? (y/n): " yn
+         [[ "$yn" == "y" ]] && cmd_enable "$u" || cmd_disable "$u"; pause ;;
+      5) read -rp "Username: " u; read -rp "Confirm delete '$u'? (y/n): " yn
+         [[ "$yn" == "y" ]] && cmd_delete "$u"; pause ;;
+      6) cmd_status; pause ;;
+      7) cmd_diagnostics; pause ;;
+      8) cmd_restart; pause ;;
+      9) cmd_logs recent; pause ;;
+      10) cmd_uninstall; pause ;;
+      11) exit 0 ;;
+      *) log_warn "Invalid option" ;;
+    esac
+  done
+}
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
+main() {
+  local cmd="${1:-}"
+  [[ $# -gt 0 ]] && shift || true
+  case "$cmd" in
+    "") require_root "$@"; interactive_menu ;;
+    status)      cmd_status "$@" ;;
+    add)         require_root; cmd_add "$@" ;;
+    list)        cmd_list "$@" ;;
+    show)        cmd_show "$@" ;;
+    enable)      require_root; cmd_enable "$@" ;;
+    disable)     require_root; cmd_disable "$@" ;;
+    delete)      require_root; cmd_delete "$@" ;;
+    restart)     require_root; cmd_restart "$@" ;;
+    logs)        cmd_logs "$@" ;;
+    diagnostics) cmd_diagnostics "$@" ;;
+    uninstall)   cmd_uninstall "$@" ;;
+    *) die "Unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

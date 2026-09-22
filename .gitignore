@@ -1,0 +1,16 @@
+# Local/runtime artifacts — never commit secrets or generated configs
+*.log
+/etc/shadowsocks-server/
+backups/
+*.tmp
+*.bak
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+
+# Test artifacts
+/tests/**/tmp/
+/tests/**/*.actual
+node_modules/

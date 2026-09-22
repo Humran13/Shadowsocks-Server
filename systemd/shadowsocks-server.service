@@ -1,0 +1,37 @@
+[Unit]
+Description=Shadowsocks Server Manager (shadowsocks-rust ssserver)
+Documentation=https://github.com/Humran13/Shadowsocks-Server
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/ssserver -c /etc/shadowsocks-server/config.json
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=10
+KillSignal=SIGTERM
+
+# Hardening: runs as root (config is root-only 600) but capabilities are
+# stripped down to only what's needed for binding privileged ports; the
+# filesystem is otherwise locked to read-only outside runtime/config dirs.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadOnlyPaths=/etc/shadowsocks-server
+ReadWritePaths=/run/shadowsocks-server
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+LockPersonality=true
+RestrictRealtime=true
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE CAP_NET_RAW
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
