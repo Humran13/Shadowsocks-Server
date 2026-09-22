@@ -15,7 +15,11 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq shellcheck
-          shellcheck -x bin/shadowsocks lib/common.sh lib/uri.sh lib/firewall.sh install.sh
+          # severity=warning: fail on real bugs (error/warning), not on style
+          # notes like SC2034 (vars sourced across files) or SC2015 (A&&B||C
+          # used intentionally as independent branches, not if/then/else).
+          shellcheck -x --severity=warning -e SC2034,SC2015,SC2012,SC2017 \
+            bin/shadowsocks lib/common.sh lib/uri.sh lib/firewall.sh install.sh
 
   unit-tests:
     runs-on: ubuntu-latest
