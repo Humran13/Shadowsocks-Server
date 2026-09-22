@@ -1,0 +1,8 @@
+* text=auto eol=lf
+
+*.sh text eol=lf
+*.bats text eol=lf
+*.py text eol=lf
+bin/shadowsocks text eol=lf
+install.sh text eol=lf
+systemd/*.service text eol=lf
